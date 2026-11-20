@@ -276,17 +276,24 @@ async def run_assignment_suite(pipeline) -> dict:
     # Retry 429/5xx from the free OpenRouter tier *inside* the LLM call, so a
     # retry never re-runs (and double-counts) the plugin chain.
     if hasattr(runner, "client_kwargs"):
-        runner.client_kwargs = {**(runner.client_kwargs or {}), "max_retries": 1, "timeout": 30}
+        runner.client_kwargs = {
+            **(runner.client_kwargs or {}),
+            "max_retries": int(os.environ.get("BLUE_MAX_RETRIES", "3")),  # 429 backoff
+            "timeout": 30,
+        }
     breaker = {"fails": 0, "open": False}
     if hasattr(runner, "_client"):
         _install_llm_deadline(
-            runner, float(os.environ.get("BLUE_LLM_TIMEOUT", "40")), breaker
+            runner,
+            float(os.environ.get("BLUE_LLM_TIMEOUT", "60")),
+            breaker,
+            max_fails=int(os.environ.get("BLUE_LLM_MAX_FAILS", "3")),
         )
     user_id = "student"  # OpenAIRunner always presents this user id to plugins
     pace = float(os.environ.get("BLUE_PACE_SECONDS", "1.0"))  # be gentle with free tier
     llm_errors = 0
 
-    async def ask(text: str, group: str) -> dict:
+    async def ask(text: str, group: str, gate_only: bool = False) -> dict:
         nonlocal llm_errors
         request_id = uuid.uuid4().hex[:12]
         audit.record_input(user_id=user_id, text=text, request_id=request_id)
@@ -298,7 +305,13 @@ async def run_assignment_suite(pipeline) -> dict:
         )
         error = None
         try:
-            response, _ = await chat_with_agent(agent, runner, text)
+            if gate_only and hasattr(runner, "_run_input_plugins"):
+                # Same pre-LLM gate the runner executes (rate limiter -> input
+                # guard); the LLM itself is not called for the flood burst.
+                block_msg = await runner._run_input_plugins(text)
+                response = block_msg or "[passed rate limiter + input guard; LLM call skipped in burst test]"
+            else:
+                response, _ = await chat_with_agent(agent, runner, text)
         except Exception as exc:  # LLM / network failure is not a guardrail decision
             llm_errors += 1
             error = f"{type(exc).__name__}: {str(exc)[:200]}"
@@ -371,7 +384,7 @@ async def run_assignment_suite(pipeline) -> dict:
     fresh_session()
     burst = []
     for i in range(RATE_LIMIT_BURST):
-        row = await ask(RATE_LIMIT_QUERY, "rate_limit")
+        row = await ask(RATE_LIMIT_QUERY, "rate_limit", gate_only=True)
         burst.append({"n": i + 1, "blocked": row["blocked"], "layer": row["layer"]})
     rl_blocked = sum(1 for r in burst if r["layer"] == "rate_limiter")
     rate_limit = {
@@ -380,6 +393,10 @@ async def run_assignment_suite(pipeline) -> dict:
         "sent": RATE_LIMIT_BURST,
         "passed": RATE_LIMIT_BURST - rl_blocked,
         "blocked": rl_blocked,
+        "mode": (
+            "flood burst sent through the pre-LLM gate (rate limiter -> input guard) "
+            "within one window; passed requests do not call the LLM"
+        ),
         "requests": burst,
     }
 
