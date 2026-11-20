@@ -21,9 +21,11 @@ import asyncio
 import json
 import os
 import re
+import threading
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from urllib.parse import urlparse
 
 from assignment.rate_limiter import RateLimitPlugin
@@ -181,6 +183,56 @@ RATE_LIMIT_QUERY = "What is my account balance?"
 # Suite runner
 # ============================================================
 
+class BlueLLMUnavailable(RuntimeError):
+    """Blue model did not answer in time (or the circuit breaker is open)."""
+
+
+def _install_llm_deadline(runner, timeout_s: float, breaker: dict, max_fails: int = 2) -> None:
+    """Give every Blue LLM call a hard wall-clock deadline + a circuit breaker.
+
+    OpenRouter keeps a queued free-tier request alive with ": OPENROUTER
+    PROCESSING" heartbeats, which reset the SDK's read timeout, so a call to an
+    overloaded free model can hang forever. The real call runs in a daemon
+    thread; if it misses the deadline the request fails fast. After
+    ``max_fails`` consecutive failures the breaker opens and later calls are
+    skipped immediately. Guardrail decisions are unaffected — plugins still run.
+    """
+    real_factory = runner._client
+
+    def guarded_client():
+        real = real_factory()
+
+        def create(**kwargs):
+            if breaker["open"]:
+                raise BlueLLMUnavailable("circuit open: Blue model unavailable, LLM call skipped")
+            box: dict = {}
+
+            def work():
+                try:
+                    box["r"] = real.chat.completions.create(**kwargs)
+                except Exception as exc:  # surfaced below
+                    box["e"] = exc
+
+            t = threading.Thread(target=work, daemon=True)
+            t.start()
+            t.join(timeout_s)
+            if t.is_alive() or "e" in box:
+                breaker["fails"] += 1
+                if breaker["fails"] >= max_fails:
+                    breaker["open"] = True
+                if "e" in box:
+                    raise box["e"]
+                raise BlueLLMUnavailable(
+                    f"no response within {timeout_s:.0f}s (provider queue / overloaded)"
+                )
+            breaker["fails"] = 0
+            return box["r"]
+
+        return SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+
+    runner._client = guarded_client
+
+
 def _find(plugins: list, cls_name: str):
     return next((p for p in plugins if type(p).__name__ == cls_name), None)
 
@@ -224,7 +276,12 @@ async def run_assignment_suite(pipeline) -> dict:
     # Retry 429/5xx from the free OpenRouter tier *inside* the LLM call, so a
     # retry never re-runs (and double-counts) the plugin chain.
     if hasattr(runner, "client_kwargs"):
-        runner.client_kwargs = {**(runner.client_kwargs or {}), "max_retries": 4, "timeout": 60}
+        runner.client_kwargs = {**(runner.client_kwargs or {}), "max_retries": 1, "timeout": 30}
+    breaker = {"fails": 0, "open": False}
+    if hasattr(runner, "_client"):
+        _install_llm_deadline(
+            runner, float(os.environ.get("BLUE_LLM_TIMEOUT", "40")), breaker
+        )
     user_id = "student"  # OpenAIRunner always presents this user id to plugins
     pace = float(os.environ.get("BLUE_PACE_SECONDS", "1.0"))  # be gentle with free tier
     llm_errors = 0
@@ -371,6 +428,7 @@ async def run_assignment_suite(pipeline) -> dict:
             "edge_blocked": sum(r["blocked"] for r in edge_rows),
             "egress_policy_ok": all(r["ok"] for r in egress_rows),
             "llm_errors": llm_errors,
+            "blue_llm_circuit_open": breaker["open"],
         },
     }
 
