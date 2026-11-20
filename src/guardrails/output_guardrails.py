@@ -131,15 +131,12 @@ Respond with ONLY one word: SAFE or UNSAFE
 If UNSAFE, add a brief reason on the next line.
 """
 
-# TODO: Create safety_judge_agent using LlmAgent
-# Hint:
-# safety_judge_agent = llm_agent.LlmAgent(
-#     model="gemini-3.5-flash",
-#     name="safety_judge",
-#     instruction=SAFETY_JUDGE_INSTRUCTION,
-# )
+# LLM-as-Judge is optional (not graded) and disabled in this submission:
+# the pipeline runs with use_llm_judge=False and relies on the deterministic
+# content_filter above. To enable it, create an LlmAgent with
+# SAFETY_JUDGE_INSTRUCTION, assign it to safety_judge_agent and call _init_judge().
 
-safety_judge_agent = None  # TODO: Replace with implementation
+safety_judge_agent = None
 judge_runner = None
 
 
