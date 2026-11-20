@@ -23,6 +23,7 @@ class RateLimitPlugin(base_plugin.BasePlugin):
         self.user_windows: dict[str, deque] = defaultdict(deque)
         self.blocked_count = 0
         self.total_count = 0
+        self.last_blocked = False
 
     def _block_response(self, message: str) -> types.Content:
         return types.Content(
@@ -37,13 +38,32 @@ class RateLimitPlugin(base_plugin.BasePlugin):
         now = time.time()
         window = self.user_windows[user_id]
 
-        # TODO: Implement sliding window:
-        # 1. Pop timestamps older than (now - window_seconds) from the left
-        # 2. If len(window) >= max_requests:
-        #       wait = window_seconds - (now - window[0])
-        #       self.blocked_count += 1
-        #       return self._block_response(
-        #           f"Rate limit exceeded. Try again in {wait:.0f}s."
-        #       )
-        # 3. Else: append now, return None
-        raise NotImplementedError("Implement RateLimitPlugin.on_user_message_callback")
+        # 1. Slide the window: drop timestamps older than window_seconds
+        cutoff = now - self.window_seconds
+        while window and window[0] <= cutoff:
+            window.popleft()
+
+        # 2. Full window -> block WITHOUT calling the LLM.
+        #    Blocked requests are not recorded, so a client that keeps
+        #    hammering is let back in once its oldest accepted request expires.
+        if len(window) >= self.max_requests:
+            wait = max(0.0, self.window_seconds - (now - window[0]))
+            self.blocked_count += 1
+            self.last_blocked = True
+            return self._block_response(
+                f"Rate limit exceeded ({self.max_requests} requests per "
+                f"{self.window_seconds}s). Try again in {wait:.0f}s."
+            )
+
+        # 3. Accept: record timestamp, let the next layer run
+        window.append(now)
+        self.last_blocked = False
+        return None
+
+    def reset(self, user_id: str | None = None) -> None:
+        """Clear the window for one user (or everyone). Used by the test suite
+        so each test group starts as a fresh session."""
+        if user_id is None:
+            self.user_windows.clear()
+        else:
+            self.user_windows.pop(user_id, None)

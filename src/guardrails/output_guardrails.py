@@ -6,13 +6,20 @@ Checkpoint 2 — Output Guardrails
 """
 import re
 import textwrap
+import unicodedata
 
 from google.genai import types
 from google.adk.agents import llm_agent
 from google.adk import runners
 from google.adk.plugins import base_plugin
 
+from core.config import DEMO_SECRETS
 from core.utils import chat_with_agent
+
+WITHHELD_MESSAGE = (
+    "I'm sorry, I can't share internal system information. "
+    "Is there anything else I can help you with regarding your VinBank account?"
+)
 
 
 # ============================================================
@@ -37,29 +44,64 @@ def content_filter(response: str) -> dict:
         dict with 'safe', 'issues', and 'redacted' keys
     """
     issues = []
+    response = response or ""
     redacted = response
 
-    # PII patterns to check
-    PII_PATTERNS = {
-        # TODO: Add regex patterns for:
-        # - VN phone number: r"0\d{9,10}"
-        # - Email: r"[\w.-]+@[\w.-]+\.[a-zA-Z]{2,}"
-        # - National ID (CMND/CCCD): r"\b\d{9}\b|\b\d{12}\b"
-        # - API key pattern: r"sk-[a-zA-Z0-9-]+"
-        # - Password pattern: r"password\s*[:=]\s*\S+"
-    }
-
-    for name, pattern in PII_PATTERNS.items():
-        matches = re.findall(pattern, response, re.IGNORECASE)
+    # Order matters: secrets first (most specific), then generic PII, so e.g.
+    # the digits inside an API key are not half-redacted as a "phone number".
+    for name, pattern in _ALL_PATTERNS.items():
+        matches = re.findall(pattern, redacted, re.IGNORECASE)
         if matches:
             issues.append(f"{name}: {len(matches)} found")
             redacted = re.sub(pattern, "[REDACTED]", redacted, flags=re.IGNORECASE)
+
+    # Obfuscated leak: "a d m i n 1 2 3", "admin-123", "ADMIN_123"...
+    # Regex above cannot see these, so compare an alphanumeric-only view.
+    squashed = _squash(unicodedata.normalize("NFKC", response))
+    if any(needle in squashed for needle in _SECRET_NEEDLES):
+        if not any(i.startswith("known_secret") for i in issues):
+            issues.append("known_secret_obfuscated: 1 found")
 
     return {
         "safe": len(issues) == 0,
         "issues": issues,
         "redacted": redacted,
+        # Credentials must never be delivered even in redacted form —
+        # the plugin uses this flag to withhold the whole reply.
+        "has_secret": any(i.split(":")[0] in SECRET_ISSUES for i in issues),
     }
+
+
+def _squash(text: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", text.casefold())
+
+
+# --- Credentials / internal infrastructure (reply is WITHHELD) -------------
+SECRET_PATTERNS = {
+    # exact lab secrets, loaded from data/protected/vinbank_secrets.json
+    "known_secret": "(?:" + ("|".join(
+        sorted((re.escape(s) for s in DEMO_SECRETS if s), key=len, reverse=True)
+    ) or r"(?!x)x") + r")(?::\d{2,5})?",
+    "api_key": r"\bsk-[A-Za-z0-9_-]{6,}",
+    # value must look like a credential (has a digit, or is quoted) so prose
+    # such as "your password is never shared" is not withheld
+    "password": r"\b(?:password|passwd|pwd|mật\s*khẩu|mat\s*khau)\b\s*(?:is|was|=|:|là)\s*(?:[\"'`][^\"'`\s]+[\"'`]|(?=\S*\d)\S+)",
+    "internal_host": r"\b[\w-]+(?:\.[\w-]+)*\.(?:internal|local|corp|lan)(?::\d{2,5})?\b",
+    "connection_string": r"\b(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis)://\S+",
+}
+SECRET_ISSUES = set(SECRET_PATTERNS) | {"known_secret_obfuscated"}
+
+# --- Customer PII (reply is delivered with [REDACTED]) --------------------
+PII_PATTERNS = {
+    "email": r"[\w.+-]+@[\w-]+(?:\.[\w-]+)*\.[a-zA-Z]{2,}",
+    # VN mobile/landline: 0xxxxxxxxx(x) or +84xxxxxxxxx, optional separators
+    "vn_phone": r"(?<!\d)(?:\+84|0)(?:[\s.-]?\d){9,10}(?!\d)",
+    # CMND (9 digits) / CCCD (12 digits)
+    "national_id": r"(?<!\d)(?:\d{12}|\d{9})(?!\d)",
+}
+
+_ALL_PATTERNS = {**SECRET_PATTERNS, **PII_PATTERNS}
+_SECRET_NEEDLES = [n for n in {_squash(s) for s in DEMO_SECRETS} if len(n) >= 6]
 
 
 # ============================================================
@@ -149,6 +191,8 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
         self.blocked_count = 0
         self.redacted_count = 0
         self.total_count = 0
+        self.last_action: str | None = None  # None | "redacted" | "withheld" | "judge_blocked"
+        self.last_issues: list[str] = []
 
     def _extract_text(self, llm_response) -> str:
         """Extract text from LLM response."""
@@ -172,16 +216,41 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
         if not response_text:
             return llm_response
 
-        # TODO: Implement logic:
-        # 1. Call content_filter(response_text)
-        #    - If issues found: replace llm_response.content with redacted version
-        #    - Increment self.redacted_count
-        # 2. If use_llm_judge: call llm_safety_check(response_text)
-        #    - If unsafe: replace llm_response.content with a safe message
-        #    - Increment self.blocked_count
-        # 3. Return llm_response (possibly modified)
+        self.last_action = None
 
-        return llm_response  # TODO: modify if needed
+        # 1. Deterministic filter (secrets + PII)
+        result = content_filter(response_text)
+        if not result["safe"]:
+            self.last_issues = result["issues"]
+            if result["has_secret"]:
+                # Credential leak: withhold the whole reply. Partial redaction
+                # would still confirm that a secret exists and hint at context.
+                self.blocked_count += 1
+                self.last_action = "withheld"
+                self._replace(llm_response, WITHHELD_MESSAGE)
+                return llm_response
+            # Customer PII only: deliver the answer with PII masked.
+            self.redacted_count += 1
+            self.last_action = "redacted"
+            self._replace(llm_response, result["redacted"])
+            response_text = result["redacted"]
+
+        # 2. Optional LLM-as-Judge (off by default in the lab pipeline)
+        if self.use_llm_judge:
+            verdict = await llm_safety_check(response_text)
+            if not verdict["safe"]:
+                self.blocked_count += 1
+                self.last_action = "judge_blocked"
+                self._replace(llm_response, WITHHELD_MESSAGE)
+
+        # 3. Return (possibly modified) response
+        return llm_response
+
+    @staticmethod
+    def _replace(llm_response, text: str) -> None:
+        llm_response.content = types.Content(
+            role="model", parts=[types.Part.from_text(text=text)]
+        )
 
 
 # ============================================================
